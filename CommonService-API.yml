@@ -1,0 +1,822 @@
+name: CommonService-API
+
+permissions:
+  contents: write
+  security-events: write   # required by github/codeql-action/upload-sarif to publish Fortify results to GHAS
+  actions: read            # required by upload-sarif@v4's internal get-workflow-run call
+
+on:
+  push:
+    branches:
+      - dev
+      - d2
+      - QA
+      - UAT
+      - STG
+      - STG2
+      - PROD
+      - main
+    paths:
+      - 'Api/KPMG.MOF.CommonService.API/**'
+      - 'Api/KPMG.MOF.DataService/**'
+      - '.github/workflows/CommonService-API.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, d2, QA, UAT, STG, STG2, PROD]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.environment || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  BASE_VERSION: '1.0'
+  FORTIFY_SCA_VERSION: '24.4.1'
+  DOTNET_VERSION: '10.0.x'
+  CODE_FOLDER: 'Api/KPMG.MOF.CommonService.API'
+
+jobs:
+
+  # ==========================================
+  # GROUP 1: TRIGGER, ENV INIT & DR GATE
+  # ==========================================
+  initialize:
+    name: "1 | Init: Env & Context"
+    runs-on: ubuntu-latest
+    outputs:
+      env_name: ${{ steps.set-context.outputs.env_name }}
+      suffix: ${{ steps.set-context.outputs.suffix }}
+      runner: ${{ steps.set-context.outputs.runner }}
+      dr_env_name: ${{ steps.set-context.outputs.dr_env_name }}
+      dr_suffix: ${{ steps.set-context.outputs.dr_suffix }}
+      dr_runner: ${{ steps.set-context.outputs.dr_runner }}
+    steps:
+      - id: set-context
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            BRANCH="${{ inputs.environment }}"
+          fi
+
+          if [[ "$BRANCH" == "main" || "$BRANCH" == "PROD" ]]; then
+            echo "env_name=PROD" >> $GITHUB_OUTPUT
+            echo "suffix=_PROD" >> $GITHUB_OUTPUT
+            echo "runner=mof_stg_runner" >> $GITHUB_OUTPUT
+            echo "dr_env_name=PROD_DR" >> $GITHUB_OUTPUT
+            echo "dr_suffix=_PROD_DR" >> $GITHUB_OUTPUT
+            echo "dr_runner=mof_stg_runner" >> $GITHUB_OUTPUT
+          elif [[ "$BRANCH" == "STG" ]]; then
+            echo "env_name=STG" >> $GITHUB_OUTPUT
+            echo "suffix=_STG" >> $GITHUB_OUTPUT
+            echo "runner=mof_uat_runner" >> $GITHUB_OUTPUT
+          elif [[ "$BRANCH" == "STG2" ]]; then
+            echo "env_name=STG2" >> $GITHUB_OUTPUT
+            echo "suffix=_STG2" >> $GITHUB_OUTPUT
+            echo "runner=mof_stg_runner" >> $GITHUB_OUTPUT
+          elif [[ "$BRANCH" == "UAT" ]]; then
+            echo "env_name=UAT" >> $GITHUB_OUTPUT
+            echo "suffix=_UAT" >> $GITHUB_OUTPUT
+            echo "runner=mof_uat_runner" >> $GITHUB_OUTPUT
+          elif [[ "$BRANCH" == "QA" ]]; then
+            echo "env_name=QA" >> $GITHUB_OUTPUT
+            echo "suffix=_QA" >> $GITHUB_OUTPUT
+            echo "runner=MOF_Runner" >> $GITHUB_OUTPUT
+          elif [[ "$BRANCH" == "d2" ]]; then
+            echo "env_name=D2" >> $GITHUB_OUTPUT
+            echo "suffix=_D2" >> $GITHUB_OUTPUT
+            echo "runner=MOF_Runner" >> $GITHUB_OUTPUT
+          else
+            echo "env_name=dev" >> $GITHUB_OUTPUT
+            echo "suffix=" >> $GITHUB_OUTPUT
+            echo "runner=MOF_Runner" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prerequisite Summary
+        run: |
+          {
+            echo "## 1.1 Prerequisite - [PASS]"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Environment | ${{ steps.set-context.outputs.env_name }} |"
+            echo "| Branch | ${{ github.ref_name }} |"
+            echo "| Runner | ${{ steps.set-context.outputs.runner }} |"
+            echo "| Trigger | ${{ github.event_name }} |"
+            echo "| Actor | ${{ github.actor }} |"
+            echo "| Commit | ${{ github.sha }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  dr-gate:
+    name: "1 | DR Gate"
+    needs: initialize
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    env:
+      DR_SUFFIX: ${{ needs.initialize.outputs.dr_suffix }}
+      DR_ENV: ${{ needs.initialize.outputs.dr_env_name }}
+      DR_RUNNER: ${{ needs.initialize.outputs.dr_runner }}
+    steps:
+      - id: check
+        run: |
+          if [[ -n "$DR_SUFFIX" ]]; then
+            echo "enabled=true" >> $GITHUB_OUTPUT
+          else
+            echo "enabled=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: DR Gate Summary
+        run: |
+          {
+            echo "## 1.2 DR Gate"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| DR suffix | ${DR_SUFFIX:-<empty>} |"
+            echo "| DR environment | ${DR_ENV:-<empty>} |"
+            echo "| DR runner | ${DR_RUNNER:-<empty>} |"
+            echo "| DR enabled | ${{ steps.check.outputs.enabled }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
+
+  # ==========================================
+  # GROUP 2: SECURITY SCANS (Mend & Fortify)
+  # ==========================================
+  Mend-Scan:
+    name: "2 | Mend Scan (${{ needs.initialize.outputs.env_name }})"
+    needs: initialize
+    if: vars[format('RUN_MEND_COMMON{0}', needs.initialize.outputs.suffix)] == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Restore Dependencies
+        run: dotnet restore Api/KPMG.MOF.CommonService.API
+      - name: Run Mend Scan
+        run: |
+          curl -LJO https://github.com/whitesource/unified-agent-distribution/releases/latest/download/wss-unified-agent.jar
+          java -jar wss-unified-agent.jar `
+            -c wss-unified-agent.config `
+            -d "${{ github.workspace }}\Api\KPMG.MOF.CommonService.API" `
+            -product "Audit" -project "MOTFCommonAPI" `
+            -userKey "${{ secrets.MEND_SCAN_TOKEN }}"
+
+      - name: Upload Mend Logs
+        uses: actions/upload-artifact@v6
+        with:
+          name: mend-scan-logs
+          path: whitesource
+
+  Create-Fortify-Package:
+    name: "2 | Fortify Package (${{ needs.initialize.outputs.env_name }})"
+    needs: initialize
+    if: vars[format('RUN_FOD_COMMON{0}', needs.initialize.outputs.suffix)] == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'microsoft'
+          java-version: 17
+      - name: Package Application
+        shell: pwsh
+        run: |
+          curl -LJO https://tools.fortify.com/scancentral/Fortify_ScanCentral_Client_${{ env.FORTIFY_SCA_VERSION }}_x64.zip
+          Expand-Archive -Path "Fortify_ScanCentral_Client_${{ env.FORTIFY_SCA_VERSION }}_x64.zip" -DestinationPath "Fortify_ScanCentral_Client"
+          cd Api/KPMG.MOF.CommonService.API
+          & "..\..\Fortify_ScanCentral_Client\bin\scancentral.bat" package -bt dotnet -bf KPMG.MOF.CommonService.API.csproj -o ..\..\FortifyScanPackage.zip
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Commonservice-package
+          path: FortifyScanPackage.zip
+
+  Fortify-Scan:
+    name: "2 | Fortify Scan (${{ needs.initialize.outputs.env_name }})"
+    needs: [initialize, Create-Fortify-Package]
+    if: vars[format('RUN_FOD_COMMON{0}', needs.initialize.outputs.suffix)] == 'true'
+    runs-on: Fortify-Runner
+    steps:
+      - uses: actions/checkout@v7   # required so upload-sarif can resolve file paths against the repo
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: Commonservice-package
+          path: .
+
+      # 1. Submit the package to ScanCentral and capture the job token
+      - name: Run ScanCentral SAST
+        id: scancentral_step
+        shell: powershell
+        run: |
+          $output = scancentral -sscurl https://fortify.us.kworld.kpmg.com/ssc -ssctoken ${{ secrets.FORTIFY_TOKEN }} start `
+            -package FortifyScanPackage.zip -upload -uptoken ${{ secrets.FORTIFY_TOKEN }} `
+            -versionid ${{ secrets.FORTIFY_Common_VERSION_ID }}
+
+          $line = ($output | findstr /i /C:"Submitted job and received token:")
+          $TOKEN = $line -replace '^.*Submitted job and received token:\s*', ''
+          Write-Host "JOB TOKEN is: $TOKEN"
+          "job_token=$TOKEN" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # 2. Poll until the scan completes AND the FPR has finished uploading to SSC
+      - name: Wait for Job Completion
+        id: wait_step
+        if: success()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $TOKEN = '${{ steps.scancentral_step.outputs.job_token }}'
+          if ([string]::IsNullOrWhiteSpace($TOKEN)) {
+            throw "ScanCentral job token is empty. Check the 'Run ScanCentral SAST' step output."
+          }
+
+          while ($true) {
+            $output = scancentral -url https://fortifyscan.us.kworld.kpmg.com/scancentral-ctrl/ status -token $TOKEN
+            $line = ($output | findstr /i /C:"Job status:")
+            $STATUS = $line -replace '^.*Job status:\s*', ''
+            Write-Host "Current SCAN JOB Status: $STATUS"
+
+            if ($STATUS -match 'COMPLETED') {
+              while ($true) {
+                $output2 = scancentral -url https://fortifyscan.us.kworld.kpmg.com/scancentral-ctrl/ status -token $TOKEN
+                $line2 = ($output2 | findstr /i /C:"SSC upload status:")
+                $UPLOADSTATUS = $line2 -replace '^.*SSC upload status:\s*', ''
+                Write-Host "Current FPR UPLOAD Status: $UPLOADSTATUS"
+
+                if ($UPLOADSTATUS -match 'COMPLETED') {
+                  Write-Host "SCANCENTRAL JOB DONE"
+                  break
+                } elseif ($UPLOADSTATUS -match 'FAILED|CANCELED') {
+                  throw "FPR UPLOAD Error. Status: $UPLOADSTATUS"
+                }
+                Start-Sleep -Seconds 30
+              }
+              break
+            } elseif ($STATUS -match 'FAILED') {
+              throw "SCAN Job Error. Status: $STATUS"
+            } elseif ($STATUS -match 'CANCELED') {
+              throw "SCAN Job CANCELED. Status: $STATUS"
+            }
+            Start-Sleep -Seconds 30
+          }
+
+      # 3. Authenticate and export SSC results to SARIF via FCLI
+      - name: Export SSC Results to SARIF
+        id: export_sarif
+        if: success()
+        shell: powershell
+        run: |
+          fcli ssc session login --url "https://fortify.us.kworld.kpmg.com/ssc" --token ${{ secrets.FORTIFY_TOKEN }}
+          fcli ssc action run github-sast-report --appversion ${{ secrets.FORTIFY_Common_VERSION_ID }} -f fortify-results.sarif
+          fcli ssc session logout
+
+      # 4. Fix SARIF artifactLocation.uri paths for manually-created (non-submodule) folders.
+      - name: Fix SARIF file paths
+        id: fix_sarif_file_paths
+        if: success() && env.CODE_FOLDER != ''
+        shell: powershell
+        run: |
+          $sarifPath = Join-Path $env:GITHUB_WORKSPACE "fortify-results.sarif"
+          $prefix = "${{ env.CODE_FOLDER }}"
+
+          if (-not (Test-Path -LiteralPath $sarifPath)) {
+            throw "SARIF file not found at '$sarifPath'. Ensure the 'Export SSC Results to SARIF' step created it."
+          }
+
+          $prefix = $prefix -replace '\\','/'
+          if (-not $prefix.EndsWith('/')) { $prefix += '/' }
+          $sarif = Get-Content -LiteralPath $sarifPath -Raw | ConvertFrom-Json
+
+          function Prefix-ArtifactLocationUris {
+            param(
+              [Parameter(Mandatory)] $Node,
+              [Parameter(Mandatory)][string] $Prefix
+            )
+            if ($null -eq $Node) { return }
+
+            if ($Node.PSObject.Properties.Name -contains 'artifactLocation') {
+              $al = $Node.artifactLocation
+              if ($null -ne $al -and ($al.PSObject.Properties.Name -contains 'uri')) {
+                $u = [string]$al.uri
+                if (-not [string]::IsNullOrWhiteSpace($u)) {
+                  $uNorm = $u -replace '\\','/'
+                  if ($uNorm -notmatch '^[a-zA-Z][a-zA-Z0-9+\-.]*:') {
+                    $rel = $uNorm -replace '^\./', ''
+                    $rel = $rel -replace '^\.\x5c', ''
+                    $rel = $rel.TrimStart('/')
+                    $prefixNoLead = $Prefix.TrimStart('/')
+                    if (-not $rel.StartsWith($prefixNoLead)) {
+                      $al.uri = $Prefix + $rel
+                    } else {
+                      $al.uri = '/' + $rel
+                    }
+                  } else {
+                    $al.uri = $uNorm
+                  }
+                }
+              }
+            }
+
+            foreach ($prop in $Node.PSObject.Properties) {
+              $val = $prop.Value
+              if ($null -eq $val) { continue }
+              if ($val -is [System.Collections.IEnumerable] -and -not ($val -is [string])) {
+                foreach ($item in $val) {
+                  if ($null -ne $item -and $item.PSObject) { Prefix-ArtifactLocationUris -Node $item -Prefix $Prefix }
+                }
+              } elseif ($val.PSObject) {
+                Prefix-ArtifactLocationUris -Node $val -Prefix $Prefix
+              }
+            }
+          }
+
+          Prefix-ArtifactLocationUris -Node $sarif -Prefix $prefix
+
+          $json = $sarif | ConvertTo-Json -Depth 100
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText($sarifPath, $json, $utf8NoBom)
+
+          Get-Content -LiteralPath $sarifPath -Raw | ConvertFrom-Json | Out-Null
+          Write-Host "SARIF JSON validation succeeded after rewrite: $sarifPath"
+
+      # 5. Rename SARIF tool driver name so GHAS Code Scanning's Tool filter can group alerts per pipeline.
+      - name: Set SARIF Tool Name for Pipeline Grouping
+        id: rename_sarif_tool
+        if: success()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $sarifPath = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "fortify-results.sarif"
+
+          if (-not (Test-Path -LiteralPath $sarifPath)) {
+            throw "SARIF file not found at '$sarifPath'."
+          }
+
+          $sarif = Get-Content `
+            -LiteralPath $sarifPath `
+            -Raw |
+            ConvertFrom-Json
+
+          foreach ($run in $sarif.runs) {
+            if ($run.tool -and $run.tool.driver) {
+              $run.tool.driver.name = "Fortify SCA - CommonAPI"
+            }
+          }
+
+          $json = $sarif |
+            ConvertTo-Json -Depth 100
+
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+          [System.IO.File]::WriteAllText(
+            $sarifPath,
+            $json,
+            $utf8NoBom
+          )
+
+          Write-Host "SARIF tool name set to: Fortify SCA - CommonAPI"
+
+      # 6. Import SARIF into GitHub Advanced Security CodeQL
+      - name: Import SARIF into GitHub Advanced Security CodeQL
+        if: success()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: fortify-results.sarif
+          category: "${{ secrets.FORTIFY_Common_VERSION_ID }}"
+
+      # 7. Upload Fortify SARIF Artifact
+      - name: Upload Fortify SARIF Artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fortify-commonapi-${{ needs.initialize.outputs.env_name }}
+          path: fortify-results.sarif
+          if-no-files-found: warn
+
+      # 8. Fortify Summary
+      - name: Fortify Summary
+        if: always()
+        shell: powershell
+        run: |
+          $lines = @(
+            "## 2.1 Fortify Security Scan"
+            ""
+            "| Setting | Value |"
+            "|---|---|"
+            "| Environment | ${{ needs.initialize.outputs.env_name }} |"
+            "| Source | ${{ env.CODE_FOLDER }} |"
+            "| Project | CommonAPI |"
+            "| Result | ${{ job.status }} |"
+            "| SARIF | fortify-results.sarif |"
+            "| Tool| Fortify SCA - CommonAPI |"
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")
+
+
+  # ==========================================
+  # GROUP 3: ENV BUILD
+  # ==========================================
+  acr-build:
+    name: "3 | ENV Build (${{ needs.initialize.outputs.env_name }})"
+    needs: [initialize, Mend-Scan, Fortify-Scan]
+    if: |
+      always() &&
+      (needs.Mend-Scan.result == 'success' || needs.Mend-Scan.result == 'skipped') &&
+      (needs.Fortify-Scan.result == 'success' || needs.Fortify-Scan.result == 'skipped')
+    runs-on: ${{ needs.initialize.outputs.runner }}
+    outputs:
+      image_tag: ${{ steps.tag.outputs.IMAGE_TAG }}
+    env:
+      ACR_NAME: ${{ vars[format('ACR_NAME{0}', needs.initialize.outputs.suffix)] }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME_COMMON }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Azure Login
+        run: az login --identity --client-id ${{ secrets[format('AZURE_UAMI_CLIENT_ID{0}', needs.initialize.outputs.suffix)] }}
+      - name: Set Subscription
+        run: az account set --subscription ${{ secrets[format('AZURE_SUBSCRIPTION_ID{0}', needs.initialize.outputs.suffix)] }}
+      - id: tag
+        shell: powershell
+        run: |
+          $tag = "$($env:BASE_VERSION).${{ github.run_number }}"
+          echo "IMAGE_TAG=$tag" >> $env:GITHUB_ENV
+          echo "IMAGE_TAG=$tag" >> $env:GITHUB_OUTPUT
+      - name: ACR Build
+        shell: powershell
+        run: |
+          az acr build `
+            --registry $env:ACR_NAME `
+            --image "$($env:IMAGE_NAME):$($env:IMAGE_TAG)" `
+            --file Api/KPMG.MOF.CommonService.API/Dockerfile `
+            --build-arg container_registry=$($env:ACR_NAME) `
+            Api
+
+      - name: Build Summary
+        shell: powershell
+        run: |
+          Write-Host "ACR Build Completed Successfully"
+          Write-Host "Image:"
+          Write-Host "$($env:ACR_NAME).azurecr.io/$($env:IMAGE_NAME):$($env:IMAGE_TAG)"
+
+
+  # ==========================================
+  # GROUP 4: ENV DEPLOYMENT & VERIFY
+  # ==========================================
+  deploy-aca:
+    name: "4 | ENV Deploy & Verify (${{ needs.initialize.outputs.env_name }})"
+    needs: [initialize, acr-build]
+    if: |
+      always() &&
+      needs.acr-build.result == 'success'
+    runs-on: ${{ needs.initialize.outputs.runner }}
+    environment: ${{ needs.initialize.outputs.env_name }}
+    env:
+      ACR_NAME: ${{ vars[format('ACR_NAME{0}', needs.initialize.outputs.suffix)] }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME_COMMON }}
+      ACA_NAME: ${{ vars[format('ACA_NAME_COMMON{0}', needs.initialize.outputs.suffix)] }}
+      ACA_RG: ${{ vars[format('ACA_RG{0}', needs.initialize.outputs.suffix)] }}
+      IMAGE_TAG: ${{ needs.acr-build.outputs.image_tag }}
+    steps:
+      - name: Azure Login
+        run: |
+          az login --identity --client-id ${{ secrets[format('AZURE_UAMI_CLIENT_ID{0}', needs.initialize.outputs.suffix)] }}
+          az account set --subscription ${{ secrets[format('AZURE_SUBSCRIPTION_ID{0}', needs.initialize.outputs.suffix)] }}
+
+      - name: Update Container Image
+        shell: powershell
+        run: |
+          az containerapp update --name $env:ACA_NAME --resource-group $env:ACA_RG `
+            --image "$($env:ACR_NAME).azurecr.io/$($env:IMAGE_NAME):$($env:IMAGE_TAG)"
+
+      - name: Set Container App Environment Variables
+        shell: powershell
+        run: |
+          $S = "${{ needs.initialize.outputs.suffix }}"
+          az containerapp update --name $env:ACA_NAME --resource-group $env:ACA_RG --set-env-vars `
+            AZURE_AD_TENANT_ID="${{ secrets.AZURE_AD_TENANT_ID }}" `
+            AZUREAD__AUDIENCE="${{ secrets[format('AZUREAD__AUDIENCE{0}', needs.initialize.outputs.suffix)] }}" `
+            AZURE_AD_CLIENT_ID="${{ secrets[format('AZURE_AD_CLIENT_ID{0}', needs.initialize.outputs.suffix)] }}" `
+            AzureQueue__ConnectionString="${{ vars[format('AzureQueue__ConnectionString{0}', needs.initialize.outputs.suffix)] }}" `
+            AzureQueue__QueueName="${{ vars[format('AzureQueue__QueueName{0}', needs.initialize.outputs.suffix)] }}" `
+            IsEnabledADB="${{ vars.ISENABLEDADB }}" `
+            Databricks__TenantId="${{ vars.Databricks__TenantId }}" `
+            Databricks__ResourceId="${{ vars.Databricks__ResourceId }}" `
+            Databricks__AppId="${{ vars[format('Databricks__AppId{0}', needs.initialize.outputs.suffix)] }}" `
+            Databricks__ServerHostname="${{ vars[format('Databricks__ServerHostname{0}', needs.initialize.outputs.suffix)] }}" `
+            Databricks__HttpPath="${{ vars[format('Databricks__HttpPath{0}', needs.initialize.outputs.suffix)] }}" `
+            Databricks__CatalogName="${{ vars[format('Databricks__CatalogName{0}', needs.initialize.outputs.suffix)] }}" `
+            Databricks__SchemaName="${{ vars.Databricks__SchemaName }}" `
+            KeyVault__VaultUrl="${{ vars[format('KeyVault__VaultUrl{0}', needs.initialize.outputs.suffix)] }}" `
+            KeyVault__Name="${{ vars[format('KeyVault__Name{0}', needs.initialize.outputs.suffix)] }}" `
+            KeyVault__ManagedIdentityClientId="${{ vars[format('KeyVault__ManagedIdentityClientId{0}', needs.initialize.outputs.suffix)] }}" `
+            KeyVault__AppInsightsConnectionString="${{ vars[format('AppInsights__ConnectionString{0}', needs.initialize.outputs.suffix)] }}" `
+            KeyVault__DatabricksClientSecretName="${{ vars[format('Databricks__ClientSecretName{0}', needs.initialize.outputs.suffix)] }}" `
+            KeyVault__StorageQueueConnectionString="${{ vars[format('StorageQueue__ConnectionString{0}', needs.initialize.outputs.suffix)] }}" `
+            KeyVault__MulesoftAPIClientSecret="${{ vars[format('MulesoftAPI__ClientSecret{0}', needs.initialize.outputs.suffix)] }}" `
+            KeyVault__MulesoftAPIPiInquiryClientSecret="${{ vars[format('MulesoftAPI__PiInquiryClientSecret{0}', needs.initialize.outputs.suffix)] }}" `
+            KeyVault__RedisConnectionString="${{ vars[format('Redis__ConnectionString{0}', needs.initialize.outputs.suffix)] }}" `
+            MANAGED_IDENTITY_CLIENT_ID="${{ vars[format('KeyVault__ManagedIdentityClientId{0}', needs.initialize.outputs.suffix)] }}" `
+            MulesoftAPI__TokenUrl="${{ vars.MulesoftAPI__TokenUrl }}" `
+            MulesoftAPI__ClientId="${{ vars[format('MulesoftAPI__ClientId{0}', needs.initialize.outputs.suffix)] }}" `
+            MulesoftAPI__Scope="${{ vars.MulesoftAPI__Scope }}" `
+            MulesoftAPI__PiInquiryUrl="${{ vars[format('MulesoftAPI__PiInquiryUrl{0}', needs.initialize.outputs.suffix)] }}" `
+            MulesoftAPI__PiInquiryClientId="${{ vars.MulesoftAPI__PiInquiryClientId }}" `
+            Redis__Hostname="${{ vars[format('Redis__Hostname{0}', needs.initialize.outputs.suffix)] }}" `
+            Redis__ConnectionString="${{ secrets[format('Redis__ConnectionString{0}', needs.initialize.outputs.suffix)] }}" `
+            Redis__ManagedIdentityClientId="${{ vars[format('Redis__ManagedIdentityClientId{0}', needs.initialize.outputs.suffix)] }}" `
+            Redis__InstanceName="${{ vars.Redis__InstanceName }}" `
+            Redis__PageContentCacheMinutes="${{ vars.Redis__PageContentCacheMinutes }}"
+
+      - name: Deployment Summary
+        shell: powershell
+        run: |
+          $lines = @(
+            "## 4.1 Deploy ACA summary"
+            ""
+            "### 4.1 Deploy Container App - [PASS] SUCCESS"
+            ""
+            "**Deployment Configuration**"
+            ""
+            "| Setting | Value |"
+            "|---|---|"
+            "| Environment | ${{ needs.initialize.outputs.env_name }} |"
+            "| ACR | $env:ACR_NAME |"
+            "| Image | $($env:IMAGE_NAME):$($env:IMAGE_TAG) |"
+            "| Container App | $env:ACA_NAME |"
+            "| Resource Group | $env:ACA_RG |"
+            "| Branch | ${{ github.ref_name }} |"
+            "| Triggered By | ${{ github.actor }} |"
+            "| Commit | ${{ github.sha }} |"
+            "| Run Number | ${{ github.run_number }} |"
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")
+
+      - name: Verify Active Revision
+        shell: powershell
+        run: |
+          $revisions = az containerapp revision list --name $env:ACA_NAME --resource-group $env:ACA_RG `
+            --query "[].{name:name, status:properties.runningState, active:properties.active, traffic:properties.trafficWeight}" -o json | ConvertFrom-Json
+
+          Write-Host "Active Container App Revisions:"
+          $revisions | Format-Table -AutoSize
+
+          $rows = @(
+            ""
+            "### 4.2 Verify Active Revision"
+            ""
+            "| Revision | Status | Active | Traffic % |"
+            "|---|---|---|---|"
+          )
+          foreach ($r in $revisions) {
+            $rows += "| $($r.name) | $($r.status) | $($r.active) | $($r.traffic) |"
+          }
+
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($rows -join "`n")
+
+
+  # ==========================================
+  # GROUP 5: DR DEPLOYMENT & VERIFY
+  # ==========================================
+  import-dr-acr:
+    name: "5 | DR Import Image"
+    needs: [initialize, dr-gate, acr-build, deploy-aca]
+    if: |
+      always() &&
+      needs.dr-gate.outputs.enabled == 'true' &&
+      needs.acr-build.result == 'success' &&
+      needs.deploy-aca.result == 'success'
+    runs-on: ${{ needs.initialize.outputs.dr_runner }}
+    environment: ${{ needs.initialize.outputs.dr_env_name }}
+    env:
+      SRC_ACR: ${{ vars[format('ACR_NAME{0}', needs.initialize.outputs.suffix)] }}
+      DR_ACR: ${{ vars[format('ACR_NAME{0}', needs.initialize.outputs.dr_suffix)] }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME_COMMON }}
+      IMAGE_TAG: ${{ needs.acr-build.outputs.image_tag }}
+    steps:
+      - name: Azure Login
+        run: |
+          az login --identity --client-id ${{ secrets[format('AZURE_UAMI_CLIENT_ID{0}', needs.initialize.outputs.suffix)] }}
+          az account set --subscription ${{ secrets[format('AZURE_SUBSCRIPTION_ID{0}', needs.initialize.outputs.suffix)] }}
+
+      # Server-side copy of the image built once in acr-build. No rebuild; digest is preserved.
+      - name: Import Image to DR ACR
+        shell: powershell
+        run: |
+          az acr import --name $env:DR_ACR `
+            --source "$($env:SRC_ACR).azurecr.io/$($env:IMAGE_NAME):$($env:IMAGE_TAG)" `
+            --image "$($env:IMAGE_NAME):$($env:IMAGE_TAG)" --force
+
+      - name: Verify Digest Match
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ref = "$($env:IMAGE_NAME):$($env:IMAGE_TAG)"
+          $prodDigest = az acr repository show --name $env:SRC_ACR --image $ref --query digest -o tsv
+          $drDigest   = az acr repository show --name $env:DR_ACR  --image $ref --query digest -o tsv
+          if ($prodDigest -ne $drDigest) {
+            throw "Digest mismatch. PROD=$prodDigest DR=$drDigest"
+          }
+          $lines = @(
+            "## 5.1 Import Image to DR ACR - [PASS]"
+            ""
+            "| Setting | Value |"
+            "|---|---|"
+            "| Source | $($env:SRC_ACR).azurecr.io |"
+            "| Target | $($env:DR_ACR).azurecr.io |"
+            "| Image | $ref |"
+            "| Digest | $drDigest |"
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")
+
+  deploy-dr-aca:
+    name: "5 | DR Deploy & Verify"
+    needs: [initialize, dr-gate, acr-build, import-dr-acr]
+    if: |
+      always() &&
+      needs.dr-gate.outputs.enabled == 'true' &&
+      needs.import-dr-acr.result == 'success'
+    runs-on: ${{ needs.initialize.outputs.dr_runner }}
+    environment: ${{ needs.initialize.outputs.dr_env_name }}
+    env:
+      ACR_NAME: ${{ vars[format('ACR_NAME{0}', needs.initialize.outputs.dr_suffix)] }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME_COMMON }}
+      ACA_NAME: ${{ vars[format('ACA_NAME_COMMON{0}', needs.initialize.outputs.dr_suffix)] }}
+      ACA_RG: ${{ vars[format('ACA_RG{0}', needs.initialize.outputs.dr_suffix)] }}
+      IMAGE_TAG: ${{ needs.acr-build.outputs.image_tag }}
+    steps:
+      - name: Azure Login
+        run: |
+          az login --identity --client-id ${{ secrets[format('AZURE_UAMI_CLIENT_ID{0}', needs.initialize.outputs.dr_suffix)] }}
+          az account set --subscription ${{ secrets[format('AZURE_SUBSCRIPTION_ID{0}', needs.initialize.outputs.dr_suffix)] }}
+
+      - name: Update Container Image
+        shell: powershell
+        run: |
+          az containerapp update --name $env:ACA_NAME --resource-group $env:ACA_RG `
+            --image "$($env:ACR_NAME).azurecr.io/$($env:IMAGE_NAME):$($env:IMAGE_TAG)"
+
+      - name: Set Container App Environment Variables
+        shell: powershell
+        run: |
+          $S = "${{ needs.initialize.outputs.dr_suffix }}"
+          az containerapp update --name $env:ACA_NAME --resource-group $env:ACA_RG --set-env-vars `
+            AZURE_AD_TENANT_ID="${{ secrets.AZURE_AD_TENANT_ID }}" `
+            AZUREAD__AUDIENCE="${{ secrets.AZUREAD__AUDIENCE_PROD }}" `
+            AZURE_AD_CLIENT_ID="${{ secrets.AZURE_AD_CLIENT_ID_PROD }}" `
+            AzureQueue__ConnectionString="${{ vars[format('AzureQueue__ConnectionString{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            AzureQueue__QueueName="${{ vars[format('AzureQueue__QueueName{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            IsEnabledADB="${{ vars.ISENABLEDADB }}" `
+            Databricks__TenantId="${{ vars.Databricks__TenantId }}" `
+            Databricks__ResourceId="${{ vars.Databricks__ResourceId }}" `
+            Databricks__AppId="${{ vars[format('Databricks__AppId{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            Databricks__ServerHostname="${{ vars[format('Databricks__ServerHostname{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            Databricks__HttpPath="${{ vars[format('Databricks__HttpPath{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            Databricks__CatalogName="${{ vars[format('Databricks__CatalogName{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            Databricks__SchemaName="${{ vars.Databricks__SchemaName }}" `
+            KeyVault__VaultUrl="${{ vars[format('KeyVault__VaultUrl{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            KeyVault__Name="${{ vars[format('KeyVault__Name{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            KeyVault__ManagedIdentityClientId="${{ vars[format('KeyVault__ManagedIdentityClientId{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            KeyVault__AppInsightsConnectionString="${{ vars[format('AppInsights__ConnectionString{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            KeyVault__DatabricksClientSecretName="${{ vars[format('Databricks__ClientSecretName{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            KeyVault__StorageQueueConnectionString="${{ vars[format('StorageQueue__ConnectionString{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            KeyVault__MulesoftAPIClientSecret="${{ vars[format('MulesoftAPI__ClientSecret{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            KeyVault__MulesoftAPIPiInquiryClientSecret="${{ vars[format('MulesoftAPI__PiInquiryClientSecret{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            KeyVault__RedisConnectionString="${{ vars[format('Redis__ConnectionString{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            MANAGED_IDENTITY_CLIENT_ID="${{ vars[format('KeyVault__ManagedIdentityClientId{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            MulesoftAPI__TokenUrl="${{ vars.MulesoftAPI__TokenUrl }}" `
+            MulesoftAPI__ClientId="${{ vars[format('MulesoftAPI__ClientId{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            MulesoftAPI__Scope="${{ vars.MulesoftAPI__Scope }}" `
+            MulesoftAPI__PiInquiryUrl="${{ vars[format('MulesoftAPI__PiInquiryUrl{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            MulesoftAPI__PiInquiryClientId="${{ vars.MulesoftAPI__PiInquiryClientId }}" `
+            Redis__Hostname="${{ vars[format('Redis__Hostname{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            Redis__ConnectionString="${{ secrets[format('Redis__ConnectionString{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            Redis__ManagedIdentityClientId="${{ vars[format('Redis__ManagedIdentityClientId{0}', needs.initialize.outputs.dr_suffix)] }}" `
+            Redis__InstanceName="${{ vars.Redis__InstanceName }}" `
+            Redis__PageContentCacheMinutes="${{ vars.Redis__PageContentCacheMinutes }}"
+
+      - name: Deployment Summary
+        shell: powershell
+        run: |
+          $lines = @(
+            "## 5.2 Deploy DR ACA summary"
+            ""
+            "### 5.2 Deploy DR Container App - [PASS] SUCCESS"
+            ""
+            "**Deployment Configuration**"
+            ""
+            "| Setting | Value |"
+            "|---|---|"
+            "| Environment | ${{ needs.initialize.outputs.dr_env_name }} |"
+            "| ACR | $env:ACR_NAME |"
+            "| Image | $($env:IMAGE_NAME):$($env:IMAGE_TAG) |"
+            "| Container App | $env:ACA_NAME |"
+            "| Resource Group | $env:ACA_RG |"
+            "| Branch | ${{ github.ref_name }} |"
+            "| Triggered By | ${{ github.actor }} |"
+            "| Commit | ${{ github.sha }} |"
+            "| Run Number | ${{ github.run_number }} |"
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")
+
+      - name: Verify Active Revision
+        shell: powershell
+        run: |
+          $revisions = az containerapp revision list --name $env:ACA_NAME --resource-group $env:ACA_RG `
+            --query "[].{name:name, status:properties.runningState, active:properties.active, traffic:properties.trafficWeight}" -o json | ConvertFrom-Json
+
+          Write-Host "Active Container App Revisions:"
+          $revisions | Format-Table -AutoSize
+
+          $rows = @(
+            ""
+            "### 5.3 Verify Active Revision"
+            ""
+            "| Revision | Status | Active | Traffic % |"
+            "|---|---|---|---|"
+          )
+          foreach ($r in $revisions) {
+            $rows += "| $($r.name) | $($r.status) | $($r.active) | $($r.traffic) |"
+          }
+
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($rows -join "`n")
+
+  validate-dr:
+    name: "5 | DR Validate"
+    needs: [initialize, dr-gate, acr-build, deploy-dr-aca]
+    if: |
+      always() &&
+      needs.dr-gate.outputs.enabled == 'true' &&
+      needs.deploy-dr-aca.result == 'success'
+    runs-on: ${{ needs.initialize.outputs.dr_runner }}
+    environment: ${{ needs.initialize.outputs.dr_env_name }}
+    env:
+      ACR_NAME: ${{ vars[format('ACR_NAME{0}', needs.initialize.outputs.dr_suffix)] }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME_COMMON }}
+      ACA_NAME: ${{ vars[format('ACA_NAME_COMMON{0}', needs.initialize.outputs.dr_suffix)] }}
+      ACA_RG: ${{ vars[format('ACA_RG{0}', needs.initialize.outputs.dr_suffix)] }}
+      IMAGE_TAG: ${{ needs.acr-build.outputs.image_tag }}
+      HEALTH_PATH: ${{ vars.DR_HEALTH_PATH || '/health' }}
+    steps:
+      - name: Azure Login
+        run: |
+          az login --identity --client-id ${{ secrets[format('AZURE_UAMI_CLIENT_ID{0}', needs.initialize.outputs.dr_suffix)] }}
+          az account set --subscription ${{ secrets[format('AZURE_SUBSCRIPTION_ID{0}', needs.initialize.outputs.dr_suffix)] }}
+
+      - name: Verify Image and Revision
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = az containerapp show --name $env:ACA_NAME --resource-group $env:ACA_RG -o json | ConvertFrom-Json
+          $expected = "$($env:ACR_NAME).azurecr.io/$($env:IMAGE_NAME):$($env:IMAGE_TAG)"
+          $actual = $app.properties.template.containers[0].image
+          if ($actual -ne $expected) {
+            throw "DR image mismatch. Expected=$expected Actual=$actual"
+          }
+          $revisions = az containerapp revision list --name $env:ACA_NAME --resource-group $env:ACA_RG `
+            --query "[].{name:name, status:properties.runningState, active:properties.active, traffic:properties.trafficWeight}" -o json | ConvertFrom-Json
+          $serving = @($revisions | Where-Object { $_.active -eq $true -and $_.status -eq 'Running' -and $_.traffic -gt 0 })
+          if ($serving.Count -eq 0) {
+            throw "No active, running DR revision is receiving traffic."
+          }
+          $revisions | Format-Table -AutoSize
+
+      - name: Health Check
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fqdn = az containerapp show --name $env:ACA_NAME --resource-group $env:ACA_RG `
+            --query "properties.configuration.ingress.fqdn" -o tsv
+          $url = "https://$fqdn$($env:HEALTH_PATH)"
+          Write-Host "Checking $url"
+          $ok = $false
+          for ($i = 1; $i -le 10 -and -not $ok; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15
+              if ($r.StatusCode -eq 200) { $ok = $true; Write-Host "Attempt $i : HTTP 200" }
+            } catch {
+              Write-Host "Attempt $i failed: $($_.Exception.Message)"
+            }
+            if (-not $ok) { Start-Sleep -Seconds 15 }
+          }
+          $result = if ($ok) { "[PASS]" } else { "[FAIL]" }
+          $lines = @(
+            "## 5.4 Validate DR Deployment - $result"
+            ""
+            "| Check | Value |"
+            "|---|---|"
+            "| Endpoint | $url |"
+            "| Image | $($env:ACR_NAME).azurecr.io/$($env:IMAGE_NAME):$($env:IMAGE_TAG) |"
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")
+          if (-not $ok) { throw "DR health check failed: $url" }
